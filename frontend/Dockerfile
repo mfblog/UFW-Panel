@@ -1,53 +1,45 @@
-FROM node:20-alpine AS deps
-RUN apk add --no-cache libc6-compat
+# Stage 1: install Node dependencies
+FROM --platform=$BUILDPLATFORM node:22-alpine AS node-deps
+RUN apk add --no-cache libc6-compat python3 build-base
 WORKDIR /app
+RUN corepack enable
+COPY package.json yarn.lock .yarnrc.yml ./
+RUN yarn config set networkTimeout 600000 -g \
+    && yarn config set networkConcurrency 1 -g \
+    && yarn install
 
-COPY package.json yarn.lock* package-lock.json* pnpm-lock.yaml* ./
-RUN \
-  if [ -f yarn.lock ]; then yarn --frozen-lockfile; \
-  elif [ -f package-lock.json ]; then npm ci; \
-  elif [ -f pnpm-lock.yaml ]; then yarn global add pnpm && pnpm i --frozen-lockfile; \
-  else echo "Lockfile not found." && exit 1; \
-  fi
-
-
-FROM node:20-alpine AS builder
+# Stage 2: build static frontend
+FROM --platform=$BUILDPLATFORM node:22-alpine AS node-build
 WORKDIR /app
-COPY --from=deps /app/node_modules ./node_modules
+RUN corepack enable
+COPY --from=node-deps /app/node_modules ./node_modules
 COPY . .
+RUN yarn build
 
-RUN \
-  if [ -f yarn.lock ]; then yarn build; \
-  elif [ -f package-lock.json ]; then npm run build; \
-  elif [ -f pnpm-lock.yaml ]; then yarn global add pnpm && pnpm run build; \
-  else echo "Lockfile not found." && exit 1; \
-  fi
-
-FROM node:20-alpine AS runner
+# Stage 3: build Go API server
+FROM golang:1.24 AS go-build
 WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY internal ./internal
+COPY cmd ./cmd
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o frontend-server ./cmd/frontend-server
 
-ENV NODE_ENV production
-ENV NEXT_TELEMETRY_DISABLED 1
-
-RUN addgroup --system --gid 1001 nodejs
-RUN adduser --system --uid 1001 nextjs
-
-COPY --from=builder /app/public ./public
-
-RUN mkdir -p .next database
-RUN chown nextjs:nodejs .next database
-
-COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
-COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
-
+# Final runtime image
+FROM alpine:3.20
+WORKDIR /app
+RUN apk add --no-cache ca-certificates tzdata && update-ca-certificates
+COPY --from=go-build /app/frontend-server ./frontend-server
+COPY --from=node-build /app/out ./out
 COPY entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENV PORT=8080
+ENV FRONTEND_DIST_DIR=/app/out
+
 ENTRYPOINT ["entrypoint.sh"]
+CMD ["./frontend-server"]
 
-USER nextjs
-
-EXPOSE 3000
-
-ENV PORT 3000
-
-CMD ["node", "server.js"]
+EXPOSE 8080
